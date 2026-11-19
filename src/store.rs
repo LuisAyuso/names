@@ -486,20 +486,53 @@ mod tests {
             me: 2,
             ..Default::default()
         };
-        a.add("Zoe");
-        a.vote("Zoe", Some(true));
+        a.add("Zzyzx");
+        a.vote("Zzyzx", Some(true));
         b.merge(Store::decode(&a.encode()));
         let before = Store::decode(&b.encode());
 
         b.reset();
-        assert!(!b.names.contains("Zoe") && b.votes.is_empty());
+        assert!(!b.names.contains("Zzyzx") && b.votes.is_empty());
         assert!(b.names.contains("Emma"), "bundled names come back");
         // A's stale broadcast doesn't bring the old votes back to B...
         assert!(!b.merge(before));
         assert!(b.votes.is_empty());
         // ...and B's newer epoch wipes A.
         assert!(a.merge(Store::decode(&b.encode())));
-        assert!(!a.names.contains("Zoe") && a.votes.is_empty());
+        assert!(!a.names.contains("Zzyzx") && a.votes.is_empty());
         assert_eq!(a.epoch, b.epoch);
+    }
+
+    #[test]
+    fn whole_state_fits_one_datagram() {
+        // Every bundled name swiped by both phones, plus room for added names.
+        let mut s = Store {
+            me: u32::MAX,
+            epoch: u64::MAX / 2,
+            cards: u32::MAX,
+            ..Default::default()
+        };
+        s.seed();
+        for i in 0..100 {
+            s.add(&format!("Added name {i}"));
+        }
+        let names: Vec<_> = s.names.iter().cloned().collect();
+        for n in names {
+            for d in [u32::MAX, u32::MAX - 1] {
+                let v = Vote {
+                    ts: u64::MAX / 2,
+                    yes: Some(true),
+                    streak: 999,
+                    due: u32::MAX,
+                    score: -999,
+                };
+                s.votes.insert((d, n.clone()), v);
+            }
+        }
+        let size = s.encode().len();
+        assert!(
+            size < 60_000,
+            "{size} bytes; sync sends the whole state in one UDP datagram"
+        );
     }
 }

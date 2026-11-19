@@ -28,8 +28,8 @@ while installing.
   - **Language**: English or Deutsch.
   - **Reset everything**: starts over on both phones.
 
-The app comes with about 100 English, Spanish, German and Austrian girls'
-names. Nothing leaves your Wi-Fi: there is no account and no server.
+The app comes with over 300 Austrian and Spanish girls' names, from
+traditional (Resi, Notburga, Covadonga) to current (Mila, Aitana). Nothing leaves your Wi-Fi: there is no account and no server.
 
 ## More
 
