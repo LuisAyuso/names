@@ -26,6 +26,7 @@ Store
   german  UI language                           (local)
   epoch   time of the last full reset, millis
   names   set of names
+  removed names deleted for good
   votes   (device, name) → Vote
 
 Vote
@@ -42,8 +43,12 @@ and merging needs no conflict handling: union of names, newest `ts` per
 deletion, so it wins the merge instead of the partner's copy bringing the old
 vote back.
 
-Names are only ever added. `add` skips a name that equals an existing one
-ignoring case and accents ("lucia" vs "Lucía").
+A removed name is kept in `removed`, which merges by union like `names`;
+merging drops it and its votes, and `add` skips it, so neither the partner's
+copy nor the bundled list brings it back. Only a full reset clears it.
+
+Apart from removals, names are only ever added. `add` skips a name that
+equals an existing one ignoring case and accents ("lucia" vs "Lucía").
 
 ## Sync
 

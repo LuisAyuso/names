@@ -11,10 +11,12 @@ const PORT: u16 = 47_474;
 const TICK: Duration = Duration::from_secs(1);
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cards between showings of a liked name, times its streak.
-const LIKE_EVERY: u32 = 10;
+/// Cards before a liked name comes back, doubling with each like in a row.
+const LIKE_EVERY: u32 = 25;
 /// Same for a discarded name.
-const NOPE_EVERY: u32 = 20;
+const NOPE_EVERY: u32 = 60;
+/// While new names last, only every this many cards may be a repeat.
+const REPEAT_TURN: u32 = 3;
 
 /// One device's swipe on a name.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -44,6 +46,9 @@ pub struct Store {
     /// epoch is ignored and a newer one wipes ours, so a reset reaches both phones.
     pub epoch: u64,
     pub names: BTreeSet<String>,
+    /// Names deleted for good; synced like names, so a delete on one phone
+    /// wins over the other phone's copy and over the bundled list.
+    pub removed: BTreeSet<String>,
     pub votes: BTreeMap<(u32, String), Vote>,
 }
 
@@ -62,6 +67,7 @@ impl Store {
 
     fn wipe(&mut self, epoch: u64) {
         self.names.clear();
+        self.removed.clear();
         self.votes.clear();
         self.cards = 0;
         self.epoch = epoch;
@@ -71,9 +77,17 @@ impl Store {
     pub fn add(&mut self, name: &str) {
         let name = name.trim().replace(['\t', '\n', '\r'], " ");
         let key = fold(&name);
-        if !name.is_empty() && !self.names.iter().any(|n| fold(n) == key) {
+        let taken = |set: &BTreeSet<String>| set.iter().any(|n| fold(n) == key);
+        if !name.is_empty() && !taken(&self.names) && !taken(&self.removed) {
             self.names.insert(name);
         }
+    }
+
+    /// Deletes `name` and every vote on it, on both phones.
+    pub fn remove(&mut self, name: &str) {
+        self.names.remove(name);
+        self.votes.retain(|(_, n), _| n != name);
+        self.removed.insert(name.into());
     }
 
     /// A swipe (`Some`) schedules the name again by its streak; `None` clears it
@@ -93,7 +107,8 @@ impl Store {
         if let Some(y) = yes {
             v.score = old.score + if y { 1 } else { -1 };
             v.streak = if old.yes == yes { old.streak + 1 } else { 1 };
-            v.due = self.cards + v.streak * if y { LIKE_EVERY } else { NOPE_EVERY };
+            let every = if y { LIKE_EVERY } else { NOPE_EVERY };
+            v.due = self.cards + (every << (v.streak - 1).min(6));
             self.cards += 1;
         }
         self.votes.insert((self.me, name.into()), v);
@@ -103,16 +118,17 @@ impl Store {
         self.votes.get(&(self.me, name.into())).and_then(|v| v.yes)
     }
 
-    /// Repeats that are due first, then new names in this device's shuffled
-    /// order; with neither, the next repeat.
+    /// New names in this device's shuffled order, with a due repeat every
+    /// `REPEAT_TURN` cards; once both run out, the next repeat.
     pub fn next(&self) -> Option<String> {
         let shuffled =
             |n: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one((self.me, n));
+        let repeat_turn = self.cards % REPEAT_TURN == REPEAT_TURN - 1;
         self.names
             .iter()
             .min_by_key(|n| match self.votes.get(&(self.me, n.to_string())) {
-                Some(v) if v.yes.is_some() => (v.due.max(self.cards), false, shuffled(n)),
-                _ => (self.cards, true, shuffled(n)),
+                Some(v) if v.yes.is_some() => (v.due.max(self.cards), !repeat_turn, shuffled(n)),
+                _ => (self.cards, repeat_turn, shuffled(n)),
             })
             .cloned()
     }
@@ -159,10 +175,19 @@ impl Store {
         if changed {
             self.wipe(other.epoch);
         }
+        for n in other.removed {
+            if !self.removed.contains(&n) {
+                self.remove(&n);
+                changed = true;
+            }
+        }
         for n in other.names {
-            changed |= self.names.insert(n);
+            changed |= !self.removed.contains(&n) && self.names.insert(n);
         }
         for (k, v) in other.votes {
+            if self.removed.contains(&k.1) {
+                continue;
+            }
             if self.votes.get(&k).is_none_or(|old| old.ts < v.ts) {
                 self.names.insert(k.1.clone());
                 self.votes.insert(k, v);
@@ -178,6 +203,9 @@ impl Store {
             "I\t{}\nC\t{}\nE\t{}\nL\t{lang}\n",
             self.me, self.cards, self.epoch
         );
+        for n in &self.removed {
+            s += &format!("R\t{n}\n");
+        }
         for n in &self.names {
             s += &format!("N\t{n}\n");
         }
@@ -219,6 +247,10 @@ impl Store {
                 }
                 ["N", n] => {
                     st.add(n);
+                    continue;
+                }
+                ["R", n] => {
+                    st.removed.insert(n.into());
                     continue;
                 }
                 ["V", d, ts, yes, streak, due, score, n] => (d, ts, yes, streak, due, score, n),
@@ -434,8 +466,8 @@ mod tests {
             s.vote("x", Some(yes));
             gaps.push(s.votes[&(1, "x".into())].due - at);
         }
-        // Discards 20, 40, 60; a change of mind restarts the streak.
-        assert_eq!(gaps, [20, 40, 60, 10, 20, 30, 20]);
+        // Discards 60, 120, 240; a change of mind restarts the streak.
+        assert_eq!(gaps, [60, 120, 240, 25, 50, 100, 60]);
 
         let mut s = Store {
             me: 1,
@@ -447,6 +479,63 @@ mod tests {
         s.vote("b", Some(true));
         // Nothing due yet, so the earliest repeat comes forward.
         assert_eq!(s.next().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn new_names_outnumber_repeats_and_every_name_comes_up() {
+        let mut s = Store {
+            me: 7,
+            ..Default::default()
+        };
+        s.seed();
+        let total = s.names.len();
+        let mut seen = BTreeSet::new();
+        let mut repeats = 0;
+        for i in 0..total {
+            let n = s.next().unwrap();
+            repeats += usize::from(!seen.insert(n.clone()));
+            s.vote(&n, Some(i % 3 == 0));
+        }
+        assert!(repeats * 3 <= total, "{repeats} repeats in {total} cards");
+        while seen.len() < total {
+            let n = s.next().unwrap();
+            seen.insert(n.clone());
+            s.vote(&n, Some(false));
+            assert!(s.cards < 2 * total as u32, "some names never came up");
+        }
+    }
+
+    #[test]
+    fn removed_names_stay_gone_on_both_phones() {
+        let mut a = Store {
+            me: 1,
+            ..Default::default()
+        };
+        let mut b = Store {
+            me: 2,
+            ..Default::default()
+        };
+        a.seed();
+        a.vote("Emma", Some(true));
+        b.merge(Store::decode(&a.encode()));
+        b.vote("Emma", Some(true));
+        let stale = Store::decode(&b.encode());
+
+        a.remove("Emma");
+        assert!(
+            !a.merge(stale),
+            "the partner's old copy brings nothing back"
+        );
+        assert!(!a.names.contains("Emma") && a.score(2, "Emma") == 0);
+        b.merge(Store::decode(&a.encode()));
+        assert!(!b.names.contains("Emma") && b.votes.keys().all(|(_, n)| n != "Emma"));
+        b.seed();
+        b.add("emma");
+        assert!(!b.names.contains("Emma") && !b.names.contains("emma"));
+        assert_eq!(Store::decode(&b.encode()), b);
+
+        b.reset();
+        assert!(b.names.contains("Emma"), "reset brings removed names back");
     }
 
     #[test]

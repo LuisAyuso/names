@@ -260,7 +260,8 @@ fn swipe_page(next: Option<String>, t: &Tr, ui: &Rc<Ui>) -> Element {
     .key(key)
 }
 
-/// Every name with your score; tapping a swiped one asks, then puts it back in the deck.
+/// Every name with your score; tapping a swiped one asks, then puts it back in
+/// the deck; swiping one left asks, then removes it for good.
 fn names_page(store: &store::Store, t: &'static Tr, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Element {
     let add_ui = ui.clone();
     let add = stateful(move |draft: &String, h| {
@@ -301,7 +302,8 @@ fn names_page(store: &store::Store, t: &'static Tr, ov: Handle<Overlays>, ui: &R
             None => text("").into(),
         };
         let (ui, name) = (ui.clone(), name.clone());
-        button(
+        let (remove_ui, remove_name) = (ui.clone(), name.clone());
+        let row = button(
             row([
                 text(name.clone())
                     .size(18.0)
@@ -324,8 +326,18 @@ fn names_page(store: &store::Store, t: &'static Tr, ov: Handle<Overlays>, ui: &R
                     ui.change(|s| s.vote(&name, None))
                 });
             }
+        });
+        Element::new(SwipeAway {
+            row: [row.into()],
+            label: t.remove,
+            on_remove: Box::new(move |cx| {
+                let (ui, name) = (remove_ui.clone(), remove_name.clone());
+                let body = (t.remove_body)(&name);
+                confirm(cx, ov, t, t.remove_title, body, t.remove, move |_| {
+                    ui.change(|s| s.remove(&name))
+                });
+            }),
         })
-        .into()
     });
     // ponytail: rebuilds every row on each change; switch to `list` if lists reach thousands.
     column([add.into(), scroll(column(rows).gap(2.0)).fill().into()])
@@ -427,6 +439,100 @@ impl Widget for ScoreRow {
 }
 
 type OnSwipe = Box<dyn Fn(&mut EventCx, bool)>;
+
+/// Lets its row be dragged left over a red strip; released past `SWIPE_AT`
+/// of its width it calls `on_remove`. Vertical drags go to the scroller.
+struct SwipeAway {
+    row: [Element; 1],
+    label: &'static str,
+    on_remove: Box<dyn Fn(&mut EventCx)>,
+}
+
+#[derive(Default)]
+struct Slide {
+    start: Option<(f32, f32)>,
+    /// The drag turned out horizontal, so this row owns it.
+    sideways: bool,
+    dx: f32,
+}
+
+/// Movement before a drag counts as horizontal or vertical.
+const SLOP: f32 = 8.0;
+
+impl Widget for SwipeAway {
+    fn children(&self) -> &[Element] {
+        &self.row
+    }
+
+    fn scroll(
+        &self,
+        state: &mut dfui::State,
+        _: dfui::Placement,
+        _: dfui::Instant,
+    ) -> Option<(f32, f32)> {
+        Some((-state.get::<Slide>().dx, 0.0))
+    }
+
+    fn paint(&self, cx: &mut PaintCx) {
+        let dx = cx.state.get::<Slide>().dx;
+        if dx >= 0.0 {
+            return;
+        }
+        let r = cx.rect;
+        let past = -dx > r.w * SWIPE_AT;
+        cx.fill(r, 0.0, RED.alpha(if past { 1.0 } else { 0.6 }));
+        let size = 16.0;
+        let layout = cx.measure(self.label, Font::BOLD, size, None);
+        let origin = (
+            r.x + r.w - 16.0 - layout.width,
+            r.y + (r.h - layout.height) / 2.0,
+        );
+        cx.text(self.label, Font::BOLD, size, Color::WHITE, None, origin);
+    }
+
+    fn event(&self, ev: &Event, cx: &mut EventCx) {
+        let w = cx.rect.w;
+        let s = cx.state.get::<Slide>();
+        match *ev {
+            Event::PointerDown { x, y } => {
+                *s = Slide {
+                    start: Some((x, y)),
+                    ..Slide::default()
+                }
+            }
+            Event::PointerMove { x, y } => {
+                let Some((sx, sy)) = s.start else { return };
+                let (dx, dy) = (x - sx, y - sy);
+                if !s.sideways {
+                    if dx.abs() > SLOP && dx.abs() > dy.abs() {
+                        s.sideways = true;
+                    } else {
+                        if dy.abs() > SLOP {
+                            s.start = None;
+                        }
+                        return;
+                    }
+                }
+                s.dx = dx.min(0.0);
+                cx.capture();
+                cx.request_redraw();
+            }
+            Event::PointerUp { .. } => {
+                let remove = s.sideways && -s.dx > w * SWIPE_AT;
+                *s = Slide::default();
+                cx.request_redraw();
+                if remove {
+                    (self.on_remove)(cx);
+                }
+            }
+            Event::Cancel => {
+                *s = Slide::default();
+                cx.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
 
 /// A name card that follows the finger horizontally; released past
 /// `SWIPE_AT` of its width it reports right (true) or left (false).

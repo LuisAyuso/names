@@ -16,15 +16,16 @@ while installing.
 ## How it works
 
 - **Swipe**: one name at a time. Every right swipe adds a point to the name,
-  every left swipe takes one away. Names come back now and then: liked ones
-  every 10, 20, 30… cards, discarded ones every 20, 40, 60….
+  every left swipe takes one away. Mostly new names come up; at most every
+  third card is a name you have seen. Liked ones come back after 25, 50,
+  100… cards, discarded ones after 60, 120, 240….
 - **Agreed**: the names you both scored above zero, highest combined score
   first, each tinted pink and blue by how much each of you likes it. The list
   stays hidden until both phones are on the same Wi-Fi and one of you taps
   **Reveal!**.
 - **Menu (☰)**:
-  - **Names**: every name with your score; add your own, or tap one to reset
-    its score.
+  - **Names**: every name with your score; add your own, tap one to reset
+    its score, or swipe one left to remove it for good on both phones.
   - **Language**: English or Deutsch.
   - **Reset everything**: starts over on both phones.
 

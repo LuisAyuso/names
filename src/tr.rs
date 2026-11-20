@@ -11,6 +11,9 @@ pub struct Tr {
     pub reset_score_title: &'static str,
     pub reset_score_body: fn(&str) -> String,
     pub reset: &'static str,
+    pub remove: &'static str,
+    pub remove_title: &'static str,
+    pub remove_body: fn(&str) -> String,
     pub cancel: &'static str,
     pub both_here: &'static str,
     pub need_both: &'static str,
@@ -40,6 +43,9 @@ const EN: Tr = Tr {
     reset_score_title: "Reset score?",
     reset_score_body: |n| format!("{n} goes back to score 0 and into the deck as new."),
     reset: "Reset",
+    remove: "Remove",
+    remove_title: "Remove name?",
+    remove_body: |n| format!("{n} disappears from both phones for good."),
     cancel: "Cancel",
     both_here: "You're both here.",
     need_both: "Reveal needs both partners on the same Wi-Fi.",
@@ -48,7 +54,7 @@ const EN: Tr = Tr {
     language: "Language",
     reset_all: "Reset everything",
     reset_all_title: "Reset everything?",
-    reset_all_body: "Deletes all swipes, scores and added names, on both phones.",
+    reset_all_body: "Deletes all swipes, scores and added names and brings back removed ones, on both phones.",
 };
 
 const DE: Tr = Tr {
@@ -63,6 +69,9 @@ const DE: Tr = Tr {
     reset_score_title: "Punkte zurücksetzen?",
     reset_score_body: |n| format!("{n} geht zurück auf 0 Punkte und kommt neu in den Stapel."),
     reset: "Zurücksetzen",
+    remove: "Entfernen",
+    remove_title: "Namen entfernen?",
+    remove_body: |n| format!("{n} verschwindet für immer von beiden Handys."),
     cancel: "Abbrechen",
     both_here: "Ihr seid beide da.",
     need_both: "Zum Aufdecken müsst ihr beide im selben WLAN sein.",
@@ -71,5 +80,5 @@ const DE: Tr = Tr {
     language: "Sprache",
     reset_all: "Alles zurücksetzen",
     reset_all_title: "Alles zurücksetzen?",
-    reset_all_body: "Löscht alle Swipes, Punkte und hinzugefügten Namen, auf beiden Handys.",
+    reset_all_body: "Löscht alle Swipes, Punkte und hinzugefügten Namen und holt entfernte zurück, auf beiden Handys.",
 };
