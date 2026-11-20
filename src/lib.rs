@@ -1,5 +1,6 @@
 mod store;
 mod tr;
+mod wallpaper;
 
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::path::Path;
@@ -16,6 +17,7 @@ use dfui::{
 };
 use store::Sync;
 use tr::Tr;
+use wallpaper::{INK, Wallpaper};
 
 const GREEN: Color = Color::hex(0x2e9d5b);
 const RED: Color = Color::hex(0xd0453a);
@@ -252,6 +254,7 @@ fn swipe_page(next: Option<String>, t: &Tr, ui: &Rc<Ui>) -> Element {
     let ui = ui.clone();
     Element::new(Card {
         name: name.clone(),
+        wall: Wallpaper::new(key),
         on_swipe: Box::new(move |_, yes| ui.change(|s| s.vote(&name, Some(yes)))),
     })
     .key(key)
@@ -429,6 +432,7 @@ type OnSwipe = Box<dyn Fn(&mut EventCx, bool)>;
 /// `SWIPE_AT` of its width it reports right (true) or left (false).
 struct Card {
     name: String,
+    wall: Wallpaper,
     on_swipe: OnSwipe,
 }
 
@@ -460,16 +464,29 @@ impl Widget for Card {
             blur: 16.0,
         };
         cx.shadow(r, 20.0, sh);
-        cx.fill(r, 20.0, cx.theme.surface);
-        cx.fill(r, 20.0, tint.alpha(t.abs() * 0.35));
-        let size = 40.0;
-        let layout = cx.measure(&self.name, Font::BOLD, size, Some(r.w - 32.0));
+        self.wall.paint(cx, r, 20.0);
+        let (font, size) = (self.wall.font, 40.0 * self.wall.scale);
+        let layout = cx.measure(&self.name, font, size, Some(r.w - 32.0));
         let origin = (
             r.x + (r.w - layout.width) / 2.0,
             r.y + (r.h - layout.height) / 2.0,
         );
-        let ink = cx.theme.ink;
-        cx.text(&self.name, Font::BOLD, size, ink, Some(r.w - 32.0), origin);
+        // A soft patch of the ground behind the name keeps motifs from crowding it.
+        let pad = 16.0;
+        let halo = Rect::new(
+            origin.0 - pad,
+            origin.1 - pad,
+            layout.width + 2.0 * pad,
+            layout.height + 2.0 * pad,
+        );
+        let glow = Shadow {
+            color: self.wall.ground.alpha(0.9),
+            offset: (0.0, 0.0),
+            blur: 24.0,
+        };
+        cx.shadow(halo, glow.blur, glow);
+        cx.fill(r, 20.0, tint.alpha(t.abs() * 0.35));
+        cx.text(&self.name, font, size, INK, Some(r.w - 32.0), origin);
     }
 
     fn event(&self, ev: &Event, cx: &mut EventCx) {

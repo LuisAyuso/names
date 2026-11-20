@@ -59,6 +59,19 @@ The app's data file is readable with
   `cargo run -p svg2path -- icons/<name>.svg assets/icons/` from a dfui
   checkout. The heart, menu and arrow come from
   [Lucide](https://lucide.dev) (ISC license).
+- Card motifs live in `icons/motifs/` and convert the same way into
+  `assets/icons/motifs/`; they come from
+  [Material Icons](https://fonts.google.com/icons) (Apache 2.0). A new motif
+  also needs a line in `MOTIFS` in `src/wallpaper.rs`.
+
+## Fonts
+
+The name typefaces in `assets/fonts/` come from
+[Google Fonts](https://fonts.google.com) under the SIL Open Font License, with
+each license next to its font. A new one needs a line in `FONTS` in
+`src/wallpaper.rs`, with a size factor so it looks as big as the others, and
+must cover every letter in `assets/seed.txt`; missing letters fall back to
+DejaVu Sans.
 
 ## Names
 

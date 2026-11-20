@@ -9,10 +9,12 @@ local network every second and merges whatever it hears.
 |---|---|
 | `src/store.rs` | `Store` (names, votes, scheduling, merge, wire format), persistence, the UDP sync thread. |
 | `src/lib.rs` | The dfui UI: navigation, drawer menu, pages, the swipe `Card` and the `ScoreRow` widgets, `android_main`. |
+| `src/wallpaper.rs` | Card looks: a pastel with one motif on a lattice and a typeface for the name, picked from the name. |
 | `src/tr.rs` | Every UI text, in English and German. |
 | `src/main.rs` | Desktop entry point. |
 | `assets/seed.txt` | Bundled names. |
 | `assets/icons/` | In-app icons as dfui paths. |
+| `assets/fonts/` | Typefaces for the names on the cards. |
 | `res/` | Android launcher icon. |
 
 ## Data
