@@ -1,7 +1,7 @@
 # Architecture
 
-Two phones, no server. Each phone keeps the whole state, broadcasts it on the
-local network every second and merges whatever it hears.
+Two phones, no server. Each phone keeps the whole state, sends it to its
+paired partner every second and merges what the partner sends.
 
 ## Files
 
@@ -22,6 +22,11 @@ local network every second and merges whatever it hears.
 ```
 Store
   me      device id, random, made on first start
+  name    display name, set on the welcome screen
+  color   index into the UI's colors
+  partner device id of the paired phone, 0 until paired
+  mate    partner's name and color as last heard  (local)
+  addr    partner's last IP                       (local)
   cards   cards this device has swiped          (local)
   german  UI language                           (local)
   epoch   time of the last full reset, millis
@@ -52,21 +57,34 @@ equals an existing one ignoring case and accents ("lucia" vs "Lucía").
 
 ## Sync
 
-`store::start` runs one thread with one UDP socket on port 47474:
+`store::start` runs one thread with one UDP socket on port 47474. Every second:
 
-- every second it sends the encoded store to `255.255.255.255` and to the
-  `/24` broadcast of the local address (some routers and phones drop one of
-  them);
-- it merges every datagram it receives, saves and wakes the UI through a
-  dfui `Notifier` when something changed;
-- a datagram from another device id marks the partner as connected; five
-  seconds without one marks it gone.
+- if the partner's address is known, it sends a hello and the encoded store
+  there by unicast (Wi-Fi retries unicast; broadcast is sent once,
+  unacknowledged, and a lost fragment loses the whole datagram). The
+  one-packet hello keeps the partner marked connected when the fragmented
+  store gets lost;
+- while the partner isn't heard, it sends a small hello (`I`, `U`, `K`, `P`
+  lines, one packet) to `255.255.255.255` and the `/24` broadcast, and every
+  fifth second to each host of the `/24`, since Android drops broadcasts
+  without a multicast lock.
+
+Each received datagram goes through `Store::hear`: a phone with a name and no
+partner pairs with the first one that is free too, or that already picked it.
+A phone whose partner says it picked someone else
+unpairs and looks again; a phone hearing from one that lost such a race
+answers with its hello so it finds out. Only the partner's datagrams are merged, and the address they came from
+becomes `addr`, saved so a restart reaches the partner without discovery.
+Five seconds without one marks the partner gone.
+
+The device id is random per install, so a reinstalled phone is a new partner:
+"New partner" in the menu unpairs, and must be done on both phones, since a
+phone that still names this one as partner pairs it back.
 
 The whole state goes in each datagram, which caps it at about 64 KB, roughly
 a thousand names with two voters. Delta sync would lift that.
 
-The partner is the other device that voted most recently, so ids left by a
-reinstalled phone stop counting.
+Saves from before pairing take as partner the other device that voted last.
 
 ### Reset
 
@@ -83,6 +101,11 @@ record per line, tab-separated:
 
 ```
 I  <device id>
+U  <name>
+K  <color>
+P  <partner id>
+M  <partner color> <partner name>
+A  <partner ip>
 C  <cards>
 E  <epoch>
 L  en|de
@@ -119,7 +142,13 @@ or from the network, rebuilds the screen.
 - **Swipe**: the `Card` widget follows the finger and reports a swipe past
   30% of its width; it's keyed by name so each new card starts undragged.
 - **Agreed**: `Store::agreed` returns names both partners scored above zero
-  with each one's score; the lower device id is pink on both phones.
+  with each one's score, painted in each partner's color.
+- **Discard**: Reveal first lists the names both partners scored −3 or
+  lower (`Store::disliked`). Each phone's agreement is the `ready` flag in its
+  hello (`D` line); `Store::settle` removes those names once both flags are
+  set, and clears the flag when none are left, so an old agreement never
+  removes names disliked later. Keep skips to the agreed names.
+- **Welcome**: shown until a name is set and a partner paired.
   `ScoreRow` paints the two bands. Reveal is part of `Nav`, so any
   navigation hides the list again.
 - **Names**: a scroll of every name; tapping a swiped one asks before

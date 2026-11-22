@@ -12,6 +12,26 @@ cargo clippy --all-targets
 Two copies on one machine can't sync: both bind UDP port 47474, so the second
 one runs without sync. Use a phone or the emulator for the other side.
 
+### Testing sync with Docker
+
+`names --headless <file> <name>` runs only the sync: it swipes a card every
+2 s and prints the pairing and sync status. `docker/` runs copies of it on
+one /24 network, using the host's debug build:
+
+```sh
+cargo build
+cd docker
+docker compose up --build              # Ana and Ben
+docker compose --profile three up      # plus Cy, to test pairing races
+LOSS=30% DROP_BROADCAST=1 docker compose up   # lossy, broadcasts dropped like Android
+docker compose stop ben; docker compose start ben   # restart: reconnects by saved IP
+docker compose --profile three down
+```
+
+The image is Arch so the host binary's glibc matches. Docker can't show the
+Android side: multicast locks, Wi-Fi client isolation and the app being
+suspended in the background still need real phones.
+
 ## Android
 
 Needs the Android SDK with platform `android-35` and an NDK, plus `cargo-apk`

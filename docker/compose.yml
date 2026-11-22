@@ -1,0 +1,26 @@
+# Headless copies of the app on one /24, see docs/development.md.
+x-peer: &peer
+  build: .
+  cap_add: [NET_ADMIN]
+  networks: [wifi]
+  volumes: [../target/debug/names:/names:ro]
+  environment: &env
+    LOSS: ${LOSS:-0%}
+    DROP_BROADCAST: ${DROP_BROADCAST:-}
+
+services:
+  ana:
+    <<: *peer
+    environment: { <<: *env, NAME: Ana }
+  ben:
+    <<: *peer
+    environment: { <<: *env, NAME: Ben }
+  cy:
+    <<: *peer
+    profiles: [three]
+    environment: { <<: *env, NAME: Cy }
+
+networks:
+  wifi:
+    ipam:
+      config: [{ subnet: 10.47.0.0/24 }]

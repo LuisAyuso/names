@@ -9,7 +9,7 @@ use std::rc::Rc;
 use dfui::taffy::{AlignItems, JustifyContent, Style};
 use dfui::widgets::{
     Overlays, Styled, button, column, dialog, drawer, icon, icon_button, on_back, overlays, row,
-    scroll, segmented, stateful, tabs, text, text_input, watch,
+    scroll, segmented, spinner, stateful, stateful_with, tabs, text, text_input, watch,
 };
 use dfui::{
     Color, Element, Event, EventCx, Font, Handle, Notifier, PaintCx, Rect, Role, Shadow, Shape,
@@ -23,6 +23,19 @@ const GREEN: Color = Color::hex(0x2e9d5b);
 const RED: Color = Color::hex(0xd0453a);
 const PINK: Color = Color::hex(0xf7c6da);
 const BLUE: Color = Color::hex(0xc4dbf7);
+/// The colors a partner can pick; `Store::color` indexes it.
+const COLORS: [Color; 6] = [
+    PINK,
+    BLUE,
+    Color::hex(0xc9ecd4),
+    Color::hex(0xfbe7a6),
+    Color::hex(0xdcd0f5),
+    Color::hex(0xfdd5bd),
+];
+
+fn color(i: u8) -> Color {
+    COLORS[i as usize % COLORS.len()]
+}
 /// Fraction of the card's width a drag must pass to count as a swipe.
 const SWIPE_AT: f32 = 0.3;
 
@@ -59,13 +72,62 @@ pub fn app(data: &Path) -> impl dfui::App {
     move || view(&ui)
 }
 
+/// Sync without a window, for testing the network: sets `name` if unset,
+/// swipes 5 cards a second, liking names of even length so both copies
+/// agree, always agrees to discard, and prints the sync status every 2 s.
+pub fn headless(data: &Path, name: &str) {
+    let sync = store::load(data);
+    {
+        let mut sh = sync.lock().unwrap();
+        if sh.store.name.is_empty() {
+            sh.store.name = store::clean(name);
+        }
+    }
+    store::start(sync.clone(), Notifier::new());
+    let mut tick = 0u32;
+    loop {
+        tick += 1;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut sh = sync.lock().unwrap();
+        let peer = sh.peer;
+        let s = &mut sh.store;
+        if let Some(n) = s.next() {
+            let yes = n.chars().count().is_multiple_of(2);
+            s.vote(&n, Some(yes));
+        }
+        s.ready = true;
+        s.settle();
+        sh.save();
+        if !tick.is_multiple_of(10) {
+            continue;
+        }
+        let s = &sh.store;
+        let theirs = s.votes.keys().filter(|(d, _)| *d == s.partner).count();
+        println!(
+            "{} me={} partner={} mate={:?} peer={} addr={:?} cards={} partner_votes={theirs} agreed={} disliked={} removed={}",
+            s.name,
+            s.me,
+            s.partner,
+            s.mate.0,
+            peer,
+            s.addr,
+            s.cards,
+            s.agreed().len(),
+            s.disliked().len(),
+            s.removed.len()
+        );
+    }
+}
+
 /// Where the user is: a main tab (0 Swipe, 1 Agreed) or the Names screen
-/// over it, and whether Agreed was revealed; any navigation hides it again.
+/// over it, whether Agreed was revealed and whether the disliked names were
+/// kept for now; any navigation hides it again.
 #[derive(Clone, Copy, Default)]
 struct Nav {
     tab: usize,
     names: bool,
     shown: bool,
+    kept: bool,
 }
 
 fn view(ui: &Rc<Ui>) -> Element {
@@ -89,9 +151,13 @@ fn go(h: Handle<Nav>, to: Nav) -> impl Fn(&mut EventCx) + Clone + 'static {
 fn screen(nav: Nav, h: Handle<Nav>, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Element {
     let sh = ui.sync.lock().unwrap();
     let t = tr::get(sh.store.german);
+    if sh.store.name.is_empty() || sh.store.partner == 0 {
+        return welcome(&sh.store, t, ui);
+    }
     let main = Nav {
         names: false,
         shown: false,
+        kept: false,
         ..nav
     };
     let header: Element = if nav.names {
@@ -130,9 +196,12 @@ fn screen(nav: Nav, h: Handle<Nav>, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Elemen
         names_page(&sh.store, t, ov, ui)
     } else if nav.tab == 0 {
         swipe_page(sh.store.next(), t, ui)
+    } else if nav.shown && !nav.kept && !sh.store.disliked().is_empty() {
+        discard_page(&sh.store, t, ui, go(h, Nav { kept: true, ..nav }))
     } else {
         let reveal = go(h, Nav { shown: true, ..nav });
-        agreed_page(sh.store.agreed(), sh.peer, nav.shown, t, reveal)
+        let colors = (color(sh.store.color), color(sh.store.mate.1));
+        agreed_page(sh.store.agreed(), colors, sh.peer, nav.shown, t, reveal)
     };
     let status = if sh.peer { t.partner_on } else { t.partner_off };
     column([
@@ -150,7 +219,68 @@ fn screen(nav: Nav, h: Handle<Nav>, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Elemen
     .into()
 }
 
-/// Side drawer with Names, the language switch and the full reset.
+/// Set your name and color, then wait until a partner on the same Wi-Fi pairs.
+fn welcome(store: &store::Store, t: &'static Tr, ui: &Rc<Ui>) -> Element {
+    let (saved, picked, german) = (store.name.clone(), store.color, store.german);
+    let ui = ui.clone();
+    let initial = saved.clone();
+    let form = stateful_with(
+        move || initial,
+        move |draft: &String, h| {
+            let swatches = COLORS.iter().enumerate().map(|(i, &c)| {
+                let ui = ui.clone();
+                let mark = if i == picked as usize { "✓" } else { "" };
+                button(text(mark).size(20.0).color(INK))
+                    .color(c)
+                    .radius(24.0)
+                    .width(48.0)
+                    .height(48.0)
+                    .on_click(move |_| ui.change(|s| s.color = i as u8))
+                    .into()
+            });
+            let (save_ui, lang_ui, value) = (ui.clone(), ui.clone(), draft.clone());
+            let name = store::clean(draft);
+            column([
+                text(t.welcome).size(28.0).into(),
+                text(t.your_name).size(13.0).color(Role::Muted).into(),
+                text_input(draft.clone())
+                    .placeholder(t.your_name)
+                    .on_change(move |cx, v| cx.update(h, |d: &mut String| *d = v))
+                    .into(),
+                text(t.your_color).size(13.0).color(Role::Muted).into(),
+                row(swatches).gap(8.0).into(),
+                button(text(t.start).color(Color::WHITE))
+                    .enabled(!name.is_empty() && name != saved)
+                    .on_click(move |_| save_ui.change(|s| s.name = store::clean(&value)))
+                    .into(),
+                segmented(tr::LANGUAGES, german as usize)
+                    .on_change(move |_, i| lang_ui.change(|s| s.german = i == 1))
+                    .into(),
+            ])
+            .gap(12.0)
+        },
+    );
+    let waiting: Element = if store.name.is_empty() {
+        text("").into()
+    } else {
+        column([
+            row([spinner().into(), text(t.waiting).into()])
+                .gap(12.0)
+                .align(AlignItems::CENTER)
+                .into(),
+            text(t.same_wifi).size(13.0).color(Role::Muted).into(),
+        ])
+        .gap(8.0)
+        .into()
+    };
+    column([form.into(), waiting])
+        .gap(32.0)
+        .padding(24.0)
+        .fill()
+        .into()
+}
+
+/// Side drawer with Names, the language switch, unpairing and the full reset.
 fn open_menu(cx: &mut EventCx, ov: Handle<Overlays>, h: Handle<Nav>, nav: Nav, ui: &Rc<Ui>) {
     let ui = ui.clone();
     ov.show(cx, move |me| {
@@ -161,6 +291,7 @@ fn open_menu(cx: &mut EventCx, ov: Handle<Overlays>, h: Handle<Nav>, nav: Nav, u
             let t = tr::get(german);
             let lang_ui = ui.clone();
             let reset_ui = ui.clone();
+            let unpair_ui = ui.clone();
             let open_names = go(
                 h,
                 Nav {
@@ -181,6 +312,22 @@ fn open_menu(cx: &mut EventCx, ov: Handle<Overlays>, h: Handle<Nav>, nav: Nav, u
                 text(t.language).size(13.0).color(Role::Muted).into(),
                 segmented(tr::LANGUAGES, german as usize)
                     .on_change(move |_, i| lang_ui.change(|s| s.german = i == 1))
+                    .into(),
+                button(text(t.new_partner).color(Role::Ink))
+                    .color(Role::Surface)
+                    .on_click(move |cx| {
+                        me.close(cx);
+                        let ui = unpair_ui.clone();
+                        confirm(
+                            cx,
+                            ov,
+                            t,
+                            t.new_partner_title,
+                            t.new_partner_body.into(),
+                            t.new_partner,
+                            move |_| ui.change(|s| s.unpair()),
+                        );
+                    })
                     .into(),
                 button(text(t.reset_all).color(Color::WHITE))
                     .color(RED)
@@ -346,9 +493,68 @@ fn names_page(store: &store::Store, t: &'static Tr, ov: Handle<Overlays>, ui: &R
         .into()
 }
 
+/// Before the reveal: the names both partners dislike, removed for good once
+/// both tap Discard; Keep skips to the agreed names.
+fn discard_page(
+    store: &store::Store,
+    t: &Tr,
+    ui: &Rc<Ui>,
+    keep: impl Fn(&mut EventCx) + 'static,
+) -> Element {
+    let names = store.disliked();
+    let mate = &store.mate.0;
+    let status = if store.ready {
+        (t.waiting_for)(mate)
+    } else if store.mate_ready {
+        (t.mate_wants)(mate)
+    } else {
+        t.both_agree.into()
+    };
+    let ui = ui.clone();
+    let toggle = move |_: &mut EventCx| {
+        ui.change(|s| {
+            s.ready = !s.ready;
+            s.settle();
+        })
+    };
+    let buttons: Element = if store.ready {
+        button(text(t.cancel).color(Role::Ink))
+            .color(Role::Surface)
+            .on_click(toggle)
+            .into()
+    } else {
+        row([
+            button(text(t.keep).color(Role::Ink))
+                .color(Role::Surface)
+                .on_click(keep)
+                .into(),
+            button(text(t.discard).color(Color::WHITE))
+                .color(RED)
+                .on_click(toggle)
+                .into(),
+        ])
+        .gap(8.0)
+        .justify(JustifyContent::FLEX_END)
+        .into()
+    };
+    let rows = names
+        .iter()
+        .map(|n| text(n.clone()).size(18.0).color(Role::Ink).into());
+    column([
+        text((t.discard_title)(names.len())).size(20.0).into(),
+        text(status).size(14.0).color(Role::Muted).into(),
+        scroll(column(rows).gap(8.0)).fill().into(),
+        buttons,
+    ])
+    .gap(12.0)
+    .fill()
+    .into()
+}
+
 /// Hidden until both partners are connected and Reveal! is tapped.
 fn agreed_page(
     names: Vec<(String, i32, i32)>,
+    (mine, theirs): (Color, Color),
     peer: bool,
     shown: bool,
     t: &Tr,
@@ -373,11 +579,11 @@ fn agreed_page(
     if names.is_empty() {
         return centered(text(t.no_agreed).color(Role::Muted).into());
     }
-    let rows = names.iter().map(|(name, pink, blue)| {
+    let rows = names.iter().map(|(name, a, b)| {
         Element::new(ScoreRow {
             name: name.clone(),
-            pink: *pink,
-            blue: *blue,
+            mine: (*a, mine),
+            theirs: (*b, theirs),
         })
     });
     scroll(column(rows).gap(6.0)).fill().into()
@@ -391,12 +597,12 @@ fn centered(child: Element) -> Element {
         .into()
 }
 
-/// An agreed name over a pink and a blue band, each as wide as that
-/// partner's share of the combined score.
+/// An agreed name over two bands in the partners' colors, each as wide as
+/// that partner's share of the combined score.
 struct ScoreRow {
     name: String,
-    pink: i32,
-    blue: i32,
+    mine: (i32, Color),
+    theirs: (i32, Color),
 }
 
 impl Widget for ScoreRow {
@@ -413,19 +619,19 @@ impl Widget for ScoreRow {
 
     fn paint(&self, cx: &mut PaintCx) {
         let r = cx.rect;
-        let total = (self.pink + self.blue) as f32;
+        let total = self.mine.0 + self.theirs.0;
         let split = Rect {
-            w: r.w * self.pink as f32 / total,
+            w: r.w * self.mine.0 as f32 / total as f32,
             ..r
         };
-        cx.fill(r, 10.0, BLUE);
-        cx.with_clip(split, |cx| cx.fill(r, 10.0, PINK));
+        cx.fill(r, 10.0, self.theirs.1);
+        cx.with_clip(split, |cx| cx.fill(r, 10.0, self.mine.1));
         let ink = cx.theme.ink;
         let size = 20.0;
         let h = cx.measure(&self.name, Font::BOLD, size, None).height;
         let y = r.y + (r.h - h) / 2.0;
         cx.text(&self.name, Font::BOLD, size, ink, None, (r.x + 16.0, y));
-        let score = format!("{}", self.pink + self.blue);
+        let score = format!("{total}");
         let w = cx.measure(&score, Font::DEFAULT, size, None).width;
         cx.text(
             &score,

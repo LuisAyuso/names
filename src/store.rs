@@ -10,6 +10,8 @@ use dfui::Notifier;
 const PORT: u16 = 47_474;
 const TICK: Duration = Duration::from_secs(1);
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ticks between sweeps of the whole /24 while the partner isn't heard.
+const SWEEP_EVERY: u32 = 5;
 
 /// Cards before a liked name comes back, doubling with each like in a row.
 const LIKE_EVERY: u32 = 25;
@@ -17,6 +19,8 @@ const LIKE_EVERY: u32 = 25;
 const NOPE_EVERY: u32 = 60;
 /// While new names last, only every this many cards may be a repeat.
 const REPEAT_TURN: u32 = 3;
+/// A name is disliked from this score down: more than two net discards.
+const DISLIKED_AT: i32 = -3;
 
 /// One device's swipe on a name.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -38,6 +42,20 @@ pub struct Vote {
 #[derive(Default, Debug, PartialEq)]
 pub struct Store {
     pub me: u32,
+    /// This device's display name; empty until set on the welcome screen.
+    pub name: String,
+    /// Index into the UI's colors.
+    pub color: u8,
+    /// The paired device, 0 until paired; only its data is merged.
+    pub partner: u32,
+    /// The partner's name and color as last heard; local.
+    pub mate: (String, u8),
+    /// This device agreed to discard the names both partners dislike.
+    pub ready: bool,
+    /// The partner's `ready` as last heard; local, not saved.
+    pub mate_ready: bool,
+    /// Where the partner was last heard; local, so a restart can reach it at once.
+    pub addr: Option<Ipv4Addr>,
     /// Cards this device has swiped; local, not synced.
     pub cards: u32,
     /// UI in German; local, not synced.
@@ -75,7 +93,7 @@ impl Store {
     }
 
     pub fn add(&mut self, name: &str) {
-        let name = name.trim().replace(['\t', '\n', '\r'], " ");
+        let name = clean(name);
         let key = fold(&name);
         let taken = |set: &BTreeSet<String>| set.iter().any(|n| fold(n) == key);
         if !name.is_empty() && !taken(&self.names) && !taken(&self.removed) {
@@ -139,27 +157,83 @@ impl Store {
             .map_or(0, |v| v.score)
     }
 
-    /// The other device that voted most recently; a reinstalled phone gets a
-    /// new id, so older ones are ignored.
-    pub fn partner(&self) -> Option<u32> {
-        self.votes
-            .iter()
-            .filter(|((d, _), _)| *d != self.me)
-            .max_by_key(|(_, v)| v.ts)
-            .map(|((d, _), _)| *d)
+    /// Pairs with `other` when both are free, or when it already picked us,
+    /// and returns whether it is our partner, whose data may be merged. A
+    /// partner that picked someone else won a race elsewhere, so we look again.
+    pub fn hear(&mut self, other: &Store) -> bool {
+        if other.me == 0 || other.me == self.me {
+            return false;
+        }
+        if other.me == self.partner && other.partner != 0 && other.partner != self.me {
+            self.unpair();
+            return false;
+        }
+        let free = |s: &Store| s.partner == 0 && !s.name.is_empty();
+        if free(self) && (free(other) || other.partner == self.me) {
+            self.partner = other.me;
+        }
+        if other.me != self.partner {
+            return false;
+        }
+        self.mate = (other.name.clone(), other.color);
+        self.mate_ready = other.ready;
+        true
     }
 
-    /// Names both partners scored above zero, as (name, pink, blue) by
-    /// highest combined score. The lower device id is pink on both phones.
-    pub fn agreed(&self) -> Vec<(String, i32, i32)> {
-        let Some(p) = self.partner() else {
+    /// Names both partners disliked, at `DISLIKED_AT` or below.
+    pub fn disliked(&self) -> Vec<String> {
+        if self.partner == 0 {
             return vec![];
-        };
-        let (pink, blue) = (self.me.min(p), self.me.max(p));
+        }
+        self.names
+            .iter()
+            .filter(|n| {
+                self.score(self.me, n) <= DISLIKED_AT && self.score(self.partner, n) <= DISLIKED_AT
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Once both partners are ready, removes the names both dislike for good.
+    /// `ready` clears when none are left, so an old agreement never discards
+    /// names disliked later. Returns whether anything changed.
+    pub fn settle(&mut self) -> bool {
+        let gone = self.disliked();
+        let both = self.ready && self.mate_ready;
+        if both {
+            for n in &gone {
+                self.remove(n);
+            }
+        }
+        let was = self.ready;
+        if both || gone.is_empty() {
+            self.ready = false;
+        }
+        (both && !gone.is_empty()) || was != self.ready
+    }
+
+    pub fn unpair(&mut self) {
+        self.partner = 0;
+        self.mate = Default::default();
+        self.addr = None;
+    }
+
+    /// Names both partners scored above zero, as (name, mine, partner's) by
+    /// highest combined score.
+    pub fn agreed(&self) -> Vec<(String, i32, i32)> {
+        if self.partner == 0 {
+            return vec![];
+        }
         let mut out: Vec<_> = self
             .names
             .iter()
-            .map(|n| (n.clone(), self.score(pink, n), self.score(blue, n)))
+            .map(|n| {
+                (
+                    n.clone(),
+                    self.score(self.me, n),
+                    self.score(self.partner, n),
+                )
+            })
             .filter(|(_, a, b)| *a > 0 && *b > 0)
             .collect();
         out.sort_by_key(|(n, a, b)| (-(a + b), n.clone()));
@@ -197,12 +271,29 @@ impl Store {
         changed
     }
 
+    /// Who this device is and whom it paired with; small enough for one
+    /// packet, so it's what goes out while looking for the partner.
+    pub fn hello(&self) -> String {
+        format!(
+            "I\t{}\nU\t{}\nK\t{}\nP\t{}\nD\t{}\n",
+            self.me,
+            self.name,
+            self.color,
+            self.partner,
+            u8::from(self.ready)
+        )
+    }
+
     pub fn encode(&self) -> String {
         let lang = if self.german { "de" } else { "en" };
-        let mut s = format!(
-            "I\t{}\nC\t{}\nE\t{}\nL\t{lang}\n",
-            self.me, self.cards, self.epoch
+        let mut s = self.hello();
+        s += &format!(
+            "C\t{}\nE\t{}\nL\t{lang}\nM\t{}\t{}\n",
+            self.cards, self.epoch, self.mate.1, self.mate.0
         );
+        if let Some(a) = self.addr {
+            s += &format!("A\t{a}\n");
+        }
         for n in &self.removed {
             s += &format!("R\t{n}\n");
         }
@@ -231,6 +322,30 @@ impl Store {
             let (d, ts, yes, streak, due, score, n) = match f[..] {
                 ["I", id] => {
                     st.me = id.parse().unwrap_or(0);
+                    continue;
+                }
+                ["U", n] => {
+                    st.name = n.into();
+                    continue;
+                }
+                ["K", c] => {
+                    st.color = c.parse().unwrap_or(0);
+                    continue;
+                }
+                ["D", r] => {
+                    st.ready = r == "1";
+                    continue;
+                }
+                ["P", p] => {
+                    st.partner = p.parse().unwrap_or(0);
+                    continue;
+                }
+                ["M", c, n] => {
+                    st.mate = (n.into(), c.parse().unwrap_or(0));
+                    continue;
+                }
+                ["A", a] => {
+                    st.addr = a.parse().ok();
                     continue;
                 }
                 ["C", c] => {
@@ -297,6 +412,11 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
+/// One line, no tabs, so it fits a record of the wire format.
+pub fn clean(s: &str) -> String {
+    s.trim().replace(['\t', '\n', '\r'], " ")
+}
+
 /// Lowercase without accents, so "Lucía" and "lucia" count as one name.
 fn fold(name: &str) -> String {
     name.to_lowercase()
@@ -342,6 +462,15 @@ pub fn load(path: &Path) -> Sync {
     if store.me == 0 {
         store.me = (RandomState::new().hash_one(SystemTime::now()) as u32).max(1);
     }
+    if store.partner == 0 {
+        // Saves from before pairing: the other device that voted last.
+        store.partner = store
+            .votes
+            .iter()
+            .filter(|((d, _), _)| *d != store.me)
+            .max_by_key(|(_, v)| v.ts)
+            .map_or(0, |((d, _), _)| *d);
+    }
     Arc::new(Mutex::new(Shared {
         store,
         peer: false,
@@ -349,7 +478,8 @@ pub fn load(path: &Path) -> Sync {
     }))
 }
 
-/// Broadcasts the whole state every second and merges whatever arrives.
+/// Every second sends the whole state to the partner's last address and, while
+/// the partner isn't heard, a hello to the whole /24; merges only the partner.
 // ponytail: full state per datagram, caps out near 64 KB (~1000 names with two voters); delta sync past that.
 pub fn start(sync: Sync, notifier: Notifier) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PORT)) {
@@ -362,23 +492,45 @@ pub fn start(sync: Sync, notifier: Notifier) {
         let mut buf = vec![0; 65_536];
         let mut sent = Instant::now() - TICK;
         let mut seen: Option<Instant> = None;
+        let mut ticks = 0u32;
         loop {
             if sent.elapsed() >= TICK {
                 sent = Instant::now();
-                let msg = sync.lock().unwrap().store.encode();
-                for to in targets() {
-                    sock.send_to(msg.as_bytes(), (to, PORT)).ok();
+                ticks += 1;
+                let (hello, full, addr, peer) = {
+                    let sh = sync.lock().unwrap();
+                    (sh.store.hello(), sh.store.encode(), sh.store.addr, sh.peer)
+                };
+                // The hello fits one packet, so it keeps the partner marked
+                // connected even when the fragmented full state gets lost.
+                if let Some(a) = addr {
+                    sock.send_to(hello.as_bytes(), (a, PORT)).ok();
+                    sock.send_to(full.as_bytes(), (a, PORT)).ok();
+                }
+                if !peer {
+                    for to in targets(ticks.is_multiple_of(SWEEP_EVERY)) {
+                        sock.send_to(hello.as_bytes(), (to, PORT)).ok();
+                    }
                 }
             }
-            if let Ok((n, _)) = sock.recv_from(&mut buf)
+            if let Ok((n, std::net::SocketAddr::V4(from))) = sock.recv_from(&mut buf)
                 && let Ok(s) = std::str::from_utf8(&buf[..n])
             {
                 let other = Store::decode(s);
                 let mut sh = sync.lock().unwrap();
-                if other.me != 0 && other.me != sh.store.me {
+                let st = &mut sh.store;
+                let before = (st.partner, st.mate.clone(), st.addr, st.mate_ready);
+                let mut changed = false;
+                if st.hear(&other) {
                     seen = Some(Instant::now());
+                    st.addr = Some(*from.ip());
+                    changed = st.merge(other);
+                    changed |= st.settle();
+                } else if other.partner == st.me {
+                    // It lost a pairing race to us; our hello tells it to look again.
+                    sock.send_to(st.hello().as_bytes(), from).ok();
                 }
-                if sh.store.merge(other) {
+                if changed || before != (st.partner, st.mate.clone(), st.addr, st.mate_ready) {
                     sh.save();
                     notifier.notify();
                 }
@@ -393,15 +545,21 @@ pub fn start(sync: Sync, notifier: Notifier) {
     });
 }
 
-/// Limited broadcast plus the /24 directed one, as some routers and phones drop either.
-fn targets() -> Vec<Ipv4Addr> {
+/// Limited and /24 directed broadcast; with `sweep` also every host of the
+/// /24, since Wi-Fi drops broadcasts and Android filters them without a lock.
+fn targets(sweep: bool) -> Vec<Ipv4Addr> {
     let mut t = vec![Ipv4Addr::BROADCAST];
     let local = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|s| s.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).map(|_| s))
         .and_then(|s| s.local_addr());
     if let Ok(std::net::SocketAddr::V4(a)) = local {
-        let [a, b, c, _] = a.ip().octets();
-        t.push(Ipv4Addr::new(a, b, c, 255));
+        let [a, b, c, me] = a.ip().octets();
+        let hosts = if sweep { 1..=255 } else { 255..=255 };
+        t.extend(
+            hosts
+                .filter(|&d| d != me)
+                .map(|d| Ipv4Addr::new(a, b, c, d)),
+        );
     }
     t
 }
@@ -414,10 +572,12 @@ mod tests {
     fn two_phones_converge() {
         let mut a = Store {
             me: 1,
+            partner: 2,
             ..Default::default()
         };
         let mut b = Store {
             me: 2,
+            partner: 1,
             ..Default::default()
         };
         a.add("Ana");
@@ -434,7 +594,7 @@ mod tests {
         assert!(b.merge(Store::decode(&a.encode())));
         assert!(!b.merge(Store::decode(&a.encode())));
 
-        let row = |n: &str, pink, blue| (n.to_string(), pink, blue);
+        let row = |n: &str, mine, theirs| (n.to_string(), mine, theirs);
         assert_eq!(a.agreed(), [row("Ana", 1, 1)]);
         assert_eq!(a.mine("Luis"), Some(false));
         assert_eq!(a.next().as_deref(), Some("Eva"));
@@ -443,14 +603,89 @@ mod tests {
         a.vote("Luis", Some(true));
         b.vote("Luis", Some(true));
         b.merge(Store::decode(&a.encode()));
-        assert_eq!(b.agreed(), [row("Luis", 1, 2), row("Ana", 1, 1)]);
+        assert_eq!(b.agreed(), [row("Luis", 2, 1), row("Ana", 1, 1)]);
         // A reset swipe puts the name back in the deck on both sides of a merge.
         a.vote("Ana", None);
         b.merge(Store::decode(&a.encode()));
         a.merge(Store::decode(&b.encode()));
         assert_eq!(a.mine("Ana"), None);
-        assert_eq!(b.agreed(), [row("Luis", 1, 2)]);
+        assert_eq!(b.agreed(), [row("Luis", 2, 1)]);
         assert_eq!(Store::decode(&b.encode()), b);
+    }
+
+    #[test]
+    fn phones_pair_once_and_ignore_others() {
+        let phone = |me, name: &str| Store {
+            me,
+            name: name.into(),
+            ..Default::default()
+        };
+        let (mut a, mut b, mut c) = (phone(1, "Ana"), phone(2, "Ben"), phone(3, "Cy"));
+        let mut nameless = phone(4, "");
+        assert!(
+            !a.hear(&nameless) && !nameless.hear(&a),
+            "no pairing before a name is set"
+        );
+        assert!(a.hear(&Store::decode(&b.hello())));
+        assert!(!c.hear(&Store::decode(&a.hello())), "a is taken");
+        assert!(b.hear(&Store::decode(&a.encode())), "b follows a's pick");
+        assert!(!a.hear(&c) && !b.hear(&c));
+        assert_eq!((a.partner, b.partner, c.partner), (2, 1, 0));
+        assert_eq!(a.mate, ("Ben".into(), 0));
+
+        a.addr = Some(Ipv4Addr::new(192, 168, 1, 7));
+        a.color = 3;
+        assert_eq!(Store::decode(&a.encode()), a);
+        a.unpair();
+        assert!(a.hear(&b), "b still picks a, so a pairs back");
+
+        // c picked a, but a picked b meanwhile: c gives up and looks again.
+        c.partner = 1;
+        assert!(!c.hear(&a) && c.partner == 0);
+    }
+
+    #[test]
+    fn names_both_dislike_go_once_both_agree() {
+        let mut a = Store {
+            me: 1,
+            partner: 2,
+            name: "Ana".into(),
+            ..Default::default()
+        };
+        let mut b = Store {
+            me: 2,
+            partner: 1,
+            name: "Ben".into(),
+            ..Default::default()
+        };
+        for n in ["X", "Y", "Z"] {
+            a.add(n);
+        }
+        for _ in 0..3 {
+            a.vote("X", Some(false));
+            a.vote("Y", Some(false));
+            b.vote("X", Some(false));
+        }
+        a.vote("Z", Some(false));
+        b.vote("Y", Some(false));
+        b.vote("Y", Some(false));
+        b.vote("Z", Some(false));
+        b.merge(Store::decode(&a.encode()));
+        a.merge(Store::decode(&b.encode()));
+        assert_eq!(a.disliked(), ["X"], "Y has two discards from b, Z one each");
+
+        a.ready = true;
+        assert!(!a.settle() && a.ready, "waits for b");
+        b.hear(&Store::decode(&a.hello()));
+        b.ready = true;
+        assert!(b.settle());
+        assert!(!b.names.contains("X") && !b.ready);
+
+        let msg = Store::decode(&b.encode());
+        a.hear(&msg);
+        a.merge(msg);
+        assert!(a.settle());
+        assert!(!a.names.contains("X") && a.names.contains("Y") && !a.ready);
     }
 
     #[test]
