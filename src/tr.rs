@@ -38,6 +38,10 @@ pub struct Tr {
     pub mate_wants: fn(&str) -> String,
     pub discard: &'static str,
     pub keep: &'static str,
+    pub which: fn(u32) -> String,
+    pub round_done: fn(&str) -> String,
+    pub duel_offline: &'static str,
+    pub winner: &'static str,
 }
 
 pub const LANGUAGES: [&str; 2] = ["English", "Deutsch"];
@@ -85,6 +89,10 @@ const EN: Tr = Tr {
     mate_wants: |m| format!("{m} wants to discard them."),
     discard: "Discard",
     keep: "Keep",
+    which: |r| format!("Round {r}: which one do you like more?"),
+    round_done: |m| format!("Round done. Waiting for {m}…"),
+    duel_offline: "Duels need you both on the same Wi-Fi.",
+    winner: "You picked",
 };
 
 const DE: Tr = Tr {
@@ -126,4 +134,8 @@ const DE: Tr = Tr {
     mate_wants: |m| format!("{m} möchte sie verwerfen."),
     discard: "Verwerfen",
     keep: "Behalten",
+    which: |r| format!("Runde {r}: Welcher gefällt dir besser?"),
+    round_done: |m| format!("Runde fertig. Warte auf {m}…"),
+    duel_offline: "Für Duelle müsst ihr beide im selben WLAN sein.",
+    winner: "Ihr habt gewählt",
 };

@@ -40,6 +40,8 @@ Vote
   streak  swipes in a row with the same verdict
   due     card number at which the name comes back
   score   +1 per right swipe, -1 per left
+  elo     Elo won or lost in duels, 25 to a swipe point
+  duels   duels this name has been in
 ```
 
 Each device only writes its own votes, so two phones never edit the same entry
@@ -111,9 +113,14 @@ E  <epoch>
 L  en|de
 N  <name>
 V  <device> <ts> <+|-|0> <streak> <due> <score> <name>
+W  <elo> <duels>
+T  <out ts>
+O  <round> <name>
 ```
 
-Older saves with shorter `V` lines still load. Saving writes a temp file and
+A `W` line belongs to the `V` line before it and is only written once a name
+has been dueled; versions without duels skip it. Older saves with shorter `V`
+lines still load. Saving writes a temp file and
 renames it, so a crash can't leave a half-written file.
 
 ## Deck order
@@ -141,8 +148,20 @@ or from the network, rebuilds the screen.
 
 - **Swipe**: the `Card` widget follows the finger and reports a swipe past
   30% of its width; it's keyed by name so each new card starts undragged.
+- **Duel**: once this phone has swiped every name, Swipe shows two agreed
+  names (`Store::duel`) as `Pick` cards; tapping one moves Elo from the loser
+  to the winner (`Store::pick`), more for an upset. Pairs take the name in
+  the fewest duels and the one closest to it in points, so the order names
+  first appeared doesn't matter. A new or reset name brings back a card.
+  Duels only run while the partner is connected. A round ends once both
+  phones dueled every remaining name `DUELS_PER_ROUND` times; then
+  `Store::eliminate` drops the bottom half by combined points into `out`,
+  until one name is left as the winner. `out` syncs as a whole, newest
+  `out_ts` wins (lower device id on a tie), so two phones eliminating at the
+  same moment settle on one result. Resetting an eliminated name's score
+  takes it out of `out`.
 - **Agreed**: `Store::agreed` returns names both partners scored above zero
-  with each one's score, painted in each partner's color.
+  with each one's points (score plus Elo), painted in each partner's color.
 - **Discard**: Reveal first lists the names both partners scored −3 or
   lower (`Store::disliked`). Each phone's agreement is the `ready` flag in its
   hello (`D` line); `Store::settle` removes those names once both flags are

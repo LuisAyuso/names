@@ -91,7 +91,11 @@ pub fn headless(data: &Path, name: &str) {
         let mut sh = sync.lock().unwrap();
         let peer = sh.peer;
         let s = &mut sh.store;
-        if let Some(n) = s.next() {
+        if s.dueling() {
+            if let Some((a, b)) = s.duel().filter(|_| peer) {
+                s.pick(&a, &b);
+            }
+        } else if let Some(n) = s.next() {
             let yes = n.chars().count().is_multiple_of(2);
             s.vote(&n, Some(yes));
         }
@@ -195,7 +199,18 @@ fn screen(nav: Nav, h: Handle<Nav>, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Elemen
     let body = if nav.names {
         names_page(&sh.store, t, ov, ui)
     } else if nav.tab == 0 {
-        swipe_page(sh.store.next(), t, ui)
+        let s = &sh.store;
+        if let Some(w) = s.winner() {
+            winner_page(w, t)
+        } else if !s.dueling() {
+            swipe_page(s.next(), t, ui)
+        } else if !sh.peer {
+            centered(text(t.duel_offline).color(Role::Muted).into())
+        } else if let Some(pair) = s.duel() {
+            duel_page(pair, s.round(), t, ui)
+        } else {
+            centered(text((t.round_done)(&s.mate.0)).color(Role::Muted).into())
+        }
     } else if nav.shown && !nav.kept && !sh.store.disliked().is_empty() {
         discard_page(&sh.store, t, ui, go(h, Nav { kept: true, ..nav }))
     } else {
@@ -407,6 +422,47 @@ fn swipe_page(next: Option<String>, t: &Tr, ui: &Rc<Ui>) -> Element {
     .key(key)
 }
 
+/// Two agreed names; tapping one picks it over the other.
+fn duel_page((a, b): (String, String), round: u32, t: &Tr, ui: &Rc<Ui>) -> Element {
+    let card = |name: &String, other: &String| {
+        let key = BuildHasherDefault::<DefaultHasher>::default().hash_one(name);
+        let (ui, win, lose) = (ui.clone(), name.clone(), other.clone());
+        Element::new(Pick {
+            name: name.clone(),
+            wall: Wallpaper::new(key),
+            on_pick: Box::new(move |_| ui.change(|s| s.pick(&win, &lose))),
+        })
+        .key(key)
+    };
+    column([
+        text((t.which)(round)).color(Role::Muted).into(),
+        card(&a, &b),
+        card(&b, &a),
+    ])
+    .gap(16.0)
+    .align(AlignItems::CENTER)
+    .fill()
+    .into()
+}
+
+/// The last name left after the duels.
+fn winner_page(name: String, t: &Tr) -> Element {
+    let key = BuildHasherDefault::<DefaultHasher>::default().hash_one(&name);
+    column([
+        text(t.winner).size(22.0).into(),
+        Element::new(Pick {
+            name: name.clone(),
+            wall: Wallpaper::new(key),
+            on_pick: Box::new(|_| {}),
+        })
+        .key(key),
+    ])
+    .gap(16.0)
+    .align(AlignItems::CENTER)
+    .fill()
+    .into()
+}
+
 /// Every name with your score; tapping a swiped one asks, then puts it back in
 /// the deck; swiping one left asks, then removes it for good.
 fn names_page(store: &store::Store, t: &'static Tr, ov: Handle<Overlays>, ui: &Rc<Ui>) -> Element {
@@ -553,7 +609,7 @@ fn discard_page(
 
 /// Hidden until both partners are connected and Reveal! is tapped.
 fn agreed_page(
-    names: Vec<(String, i32, i32)>,
+    names: Vec<(String, f32, f32)>,
     (mine, theirs): (Color, Color),
     peer: bool,
     shown: bool,
@@ -601,8 +657,8 @@ fn centered(child: Element) -> Element {
 /// that partner's share of the combined score.
 struct ScoreRow {
     name: String,
-    mine: (i32, Color),
-    theirs: (i32, Color),
+    mine: (f32, Color),
+    theirs: (f32, Color),
 }
 
 impl Widget for ScoreRow {
@@ -620,8 +676,10 @@ impl Widget for ScoreRow {
     fn paint(&self, cx: &mut PaintCx) {
         let r = cx.rect;
         let total = self.mine.0 + self.theirs.0;
+        // Duels can sink a name below zero, which leaves no share to draw.
+        let (a, b) = (self.mine.0.max(0.1), self.theirs.0.max(0.1));
         let split = Rect {
-            w: r.w * self.mine.0 as f32 / total as f32,
+            w: r.w * a / (a + b),
             ..r
         };
         cx.fill(r, 10.0, self.theirs.1);
@@ -631,7 +689,7 @@ impl Widget for ScoreRow {
         let h = cx.measure(&self.name, Font::BOLD, size, None).height;
         let y = r.y + (r.h - h) / 2.0;
         cx.text(&self.name, Font::BOLD, size, ink, None, (r.x + 16.0, y));
-        let score = format!("{total}");
+        let score = format!("{total:.0}");
         let w = cx.measure(&score, Font::DEFAULT, size, None).width;
         cx.text(
             &score,
@@ -770,35 +828,7 @@ impl Widget for Card {
         };
         let t = (dx / (r.w * SWIPE_AT)).clamp(-1.0, 1.0);
         let tint = if t > 0.0 { GREEN } else { RED };
-        let sh = Shadow {
-            color: Color::BLACK.alpha(0.15),
-            offset: (0.0, 4.0),
-            blur: 16.0,
-        };
-        cx.shadow(r, 20.0, sh);
-        self.wall.paint(cx, r, 20.0);
-        let (font, size) = (self.wall.font, 40.0 * self.wall.scale);
-        let layout = cx.measure(&self.name, font, size, Some(r.w - 32.0));
-        let origin = (
-            r.x + (r.w - layout.width) / 2.0,
-            r.y + (r.h - layout.height) / 2.0,
-        );
-        // A soft patch of the ground behind the name keeps motifs from crowding it.
-        let pad = 16.0;
-        let halo = Rect::new(
-            origin.0 - pad,
-            origin.1 - pad,
-            layout.width + 2.0 * pad,
-            layout.height + 2.0 * pad,
-        );
-        let glow = Shadow {
-            color: self.wall.ground.alpha(0.9),
-            offset: (0.0, 0.0),
-            blur: 24.0,
-        };
-        cx.shadow(halo, glow.blur, glow);
-        cx.fill(r, 20.0, tint.alpha(t.abs() * 0.35));
-        cx.text(&self.name, font, size, INK, Some(r.w - 32.0), origin);
+        paint_card(cx, r, &self.wall, &self.name, tint.alpha(t.abs() * 0.35));
     }
 
     fn event(&self, ev: &Event, cx: &mut EventCx) {
@@ -824,6 +854,84 @@ impl Widget for Card {
             _ => {}
         }
     }
+}
+
+/// A duel card; tapping it calls `on_pick`.
+struct Pick {
+    name: String,
+    wall: Wallpaper,
+    on_pick: Box<dyn Fn(&mut EventCx)>,
+}
+
+impl Widget for Pick {
+    fn style(&self) -> Style {
+        Style {
+            flex_grow: 1.0,
+            size: dfui::taffy::Size {
+                width: dfui::taffy::Dimension::percent(1.0),
+                height: dfui::taffy::Dimension::auto(),
+            },
+            ..Style::default()
+        }
+    }
+
+    fn paint(&self, cx: &mut PaintCx) {
+        let pressed = *cx.state.get::<bool>();
+        let tint = GREEN.alpha(if pressed { 0.35 } else { 0.0 });
+        paint_card(cx, cx.rect, &self.wall, &self.name, tint);
+    }
+
+    fn event(&self, ev: &Event, cx: &mut EventCx) {
+        let hit = match *ev {
+            Event::PointerDown { x, y } | Event::PointerUp { x, y } => cx.hit(x, y),
+            _ => false,
+        };
+        let pressed = cx.state.get::<bool>();
+        match ev {
+            Event::PointerDown { .. } if hit => *pressed = true,
+            Event::PointerUp { .. } => {
+                if std::mem::take(pressed) && hit {
+                    (self.on_pick)(cx);
+                }
+            }
+            Event::Cancel => *pressed = false,
+            _ => return,
+        }
+        cx.request_redraw();
+    }
+}
+
+/// The wallpapered card with `name` centered, washed with `tint`.
+fn paint_card(cx: &mut PaintCx, r: Rect, wall: &Wallpaper, name: &str, tint: Color) {
+    let sh = Shadow {
+        color: Color::BLACK.alpha(0.15),
+        offset: (0.0, 4.0),
+        blur: 16.0,
+    };
+    cx.shadow(r, 20.0, sh);
+    wall.paint(cx, r, 20.0);
+    let (font, size) = (wall.font, 40.0 * wall.scale);
+    let layout = cx.measure(name, font, size, Some(r.w - 32.0));
+    let origin = (
+        r.x + (r.w - layout.width) / 2.0,
+        r.y + (r.h - layout.height) / 2.0,
+    );
+    // A soft patch of the ground behind the name keeps motifs from crowding it.
+    let pad = 16.0;
+    let halo = Rect::new(
+        origin.0 - pad,
+        origin.1 - pad,
+        layout.width + 2.0 * pad,
+        layout.height + 2.0 * pad,
+    );
+    let glow = Shadow {
+        color: wall.ground.alpha(0.9),
+        offset: (0.0, 0.0),
+        blur: 24.0,
+    };
+    cx.shadow(halo, glow.blur, glow);
+    cx.fill(r, 20.0, tint);
+    cx.text(name, font, size, INK, Some(r.w - 32.0), origin);
 }
 
 #[cfg(target_os = "android")]

@@ -19,8 +19,14 @@ while installing.
   every left swipe takes one away. Mostly new names come up; at most every
   third card is a name you have seen. Liked ones come back after 25, 50,
   100… cards, discarded ones after 60, 120, 240….
+- **Duel**: once you have swiped every name, Swipe shows two names you both
+  like; tap the one you like more. Beating a name ranked above it moves a
+  name up a lot, beating one below it only a little, so names that showed up
+  early lose their head start. Duels run in rounds while you're both on the
+  same Wi-Fi: after each name had 3 duels on both phones, the bottom half
+  drops out, until one name is left: the one you picked.
 - **Agreed**: the names you both scored above zero, highest combined score
-  first, each tinted pink and blue by how much each of you likes it. The list
+  (swipes plus duels) first, each tinted pink and blue by how much each of you likes it. The list
   stays hidden until both phones are on the same Wi-Fi and one of you taps
   **Reveal!**.
 - **Menu (☰)**:

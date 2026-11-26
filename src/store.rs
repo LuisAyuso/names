@@ -21,6 +21,12 @@ const NOPE_EVERY: u32 = 60;
 const REPEAT_TURN: u32 = 3;
 /// A name is disliked from this score down: more than two net discards.
 const DISLIKED_AT: i32 = -3;
+/// Duels rate names by Elo on top of the swipe score; one point is this much Elo.
+const ELO_PER_POINT: f32 = 25.0;
+/// The most Elo one duel moves.
+const ELO_K: f32 = 32.0;
+/// Duels each name gets per round on each phone before the bottom half drops out.
+const DUELS_PER_ROUND: u32 = 3;
 
 /// One device's swipe on a name.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -35,6 +41,9 @@ pub struct Vote {
     pub due: u32,
     /// +1 per right swipe, -1 per left; a reset clears it.
     pub score: i32,
+    /// Elo won or lost in duels; a reset clears it.
+    pub elo: i32,
+    pub duels: u32,
 }
 
 /// Names and every device's votes. Each device only writes its own votes,
@@ -68,6 +77,10 @@ pub struct Store {
     /// wins over the other phone's copy and over the bundled list.
     pub removed: BTreeSet<String>,
     pub votes: BTreeMap<(u32, String), Vote>,
+    /// Names voted out of the duels, with the round they lost. Synced as a
+    /// whole, newest `out_ts` first, so both phones settle on one elimination.
+    pub out: Vec<(u32, String)>,
+    pub out_ts: u64,
 }
 
 impl Store {
@@ -87,6 +100,8 @@ impl Store {
         self.names.clear();
         self.removed.clear();
         self.votes.clear();
+        self.out.clear();
+        self.out_ts = 0;
         self.cards = 0;
         self.epoch = epoch;
         self.seed();
@@ -106,6 +121,14 @@ impl Store {
         self.names.remove(name);
         self.votes.retain(|(_, n), _| n != name);
         self.removed.insert(name.into());
+        self.bring_back(name);
+    }
+
+    fn bring_back(&mut self, name: &str) {
+        if self.out.iter().any(|(_, n)| n == name) {
+            self.out.retain(|(_, n)| n != name);
+            self.out_ts = now().max(self.out_ts + 1);
+        }
     }
 
     /// A swipe (`Some`) schedules the name again by its streak; `None` clears it
@@ -127,7 +150,11 @@ impl Store {
             v.streak = if old.yes == yes { old.streak + 1 } else { 1 };
             let every = if y { LIKE_EVERY } else { NOPE_EVERY };
             v.due = self.cards + (every << (v.streak - 1).min(6));
+            v.elo = old.elo;
+            v.duels = old.duels;
             self.cards += 1;
+        } else {
+            self.bring_back(name);
         }
         self.votes.insert((self.me, name.into()), v);
     }
@@ -155,6 +182,115 @@ impl Store {
         self.votes
             .get(&(device, name.into()))
             .map_or(0, |v| v.score)
+    }
+
+    /// Swipe score plus duel results, in swipe points.
+    pub fn points(&self, device: u32, name: &str) -> f32 {
+        self.votes
+            .get(&(device, name.into()))
+            .map_or(0.0, |v| v.score as f32 + v.elo as f32 / ELO_PER_POINT)
+    }
+
+    fn duels(&self, device: u32, name: &str) -> u32 {
+        self.votes
+            .get(&(device, name.into()))
+            .map_or(0, |v| v.duels)
+    }
+
+    /// The round being dueled, from 1.
+    pub fn round(&self) -> u32 {
+        self.out.iter().map(|(r, _)| r + 1).max().unwrap_or(1)
+    }
+
+    /// The agreed names still in the duels, once this device has swiped every
+    /// name and at least two are agreed.
+    fn pool(&self) -> Option<Vec<String>> {
+        if self.names.iter().any(|n| self.mine(n).is_none()) {
+            return None;
+        }
+        let agreed: Vec<String> = self.agreed().into_iter().map(|(n, ..)| n).collect();
+        let pool: Vec<String> = agreed
+            .iter()
+            .filter(|n| !self.out.iter().any(|(_, o)| o == *n))
+            .cloned()
+            .collect();
+        (agreed.len() >= 2 && !pool.is_empty()).then_some(pool)
+    }
+
+    /// Swiping is over and the duels have started.
+    pub fn dueling(&self) -> bool {
+        self.pool().is_some()
+    }
+
+    pub fn winner(&self) -> Option<String> {
+        self.pool()
+            .filter(|p| p.len() == 1)
+            .map(|mut p| p.remove(0))
+    }
+
+    /// Two names to choose between: one this phone hasn't dueled enough this
+    /// round, fewest duels first, and the one closest to it in points. None
+    /// once this phone's round is done.
+    pub fn duel(&self) -> Option<(String, String)> {
+        let pool = self.pool()?;
+        let need = DUELS_PER_ROUND * self.round();
+        let duels = |n: &str| self.duels(self.me, n);
+        let shuffled = |n: &str| {
+            BuildHasherDefault::<DefaultHasher>::default().hash_one((self.me, n, duels(n)))
+        };
+        let a = pool
+            .iter()
+            .filter(|n| duels(n) < need)
+            .min_by_key(|n| (duels(n), shuffled(n)))?;
+        let gap = |n: &str| (self.points(self.me, n) - self.points(self.me, a)).abs();
+        let b = pool
+            .iter()
+            .filter(|n| *n != a)
+            .min_by(|x, y| gap(x).total_cmp(&gap(y)).then(duels(x).cmp(&duels(y))))?;
+        // Which one sits on top varies, so position doesn't pick.
+        let pair = (a.clone(), b.clone());
+        Some(if shuffled(a) < shuffled(b) {
+            pair
+        } else {
+            (pair.1, pair.0)
+        })
+    }
+
+    /// Once both phones dueled every name enough this round, the bottom half
+    /// by combined points drops out. Returns whether anything changed.
+    pub fn eliminate(&mut self) -> bool {
+        let Some(pool) = self.pool() else {
+            return false;
+        };
+        let (round, need) = (self.round(), DUELS_PER_ROUND * self.round());
+        let done =
+            |n: &String| self.duels(self.me, n) >= need && self.duels(self.partner, n) >= need;
+        if pool.len() < 2 || self.partner == 0 || !pool.iter().all(done) {
+            return false;
+        }
+        // agreed() sorts best first, so the pool's tail is the bottom.
+        let keep = pool.len().div_ceil(2);
+        for n in &pool[keep..] {
+            self.out.push((round, n.clone()));
+        }
+        self.out_ts = now().max(self.out_ts + 1);
+        true
+    }
+
+    /// Records this device picking `winner` over `loser`: Elo moves more for an upset.
+    pub fn pick(&mut self, winner: &str, loser: &str) {
+        let gap = (self.points(self.me, loser) - self.points(self.me, winner)) * ELO_PER_POINT;
+        let expected = 1.0 / (1.0 + 10f32.powf(gap / 400.0));
+        let delta = (ELO_K * (1.0 - expected)).round() as i32;
+        let now = now();
+        for (n, d) in [(winner, delta), (loser, -delta)] {
+            if let Some(v) = self.votes.get_mut(&(self.me, n.into())) {
+                v.elo += d;
+                v.duels += 1;
+                v.ts = now.max(v.ts + 1);
+            }
+        }
+        self.eliminate();
     }
 
     /// Pairs with `other` when both are free, or when it already picked us,
@@ -218,9 +354,9 @@ impl Store {
         self.addr = None;
     }
 
-    /// Names both partners scored above zero, as (name, mine, partner's) by
-    /// highest combined score.
-    pub fn agreed(&self) -> Vec<(String, i32, i32)> {
+    /// Names both partners swiped above zero, as (name, my points, partner's)
+    /// by highest combined points.
+    pub fn agreed(&self) -> Vec<(String, f32, f32)> {
         if self.partner == 0 {
             return vec![];
         }
@@ -230,13 +366,13 @@ impl Store {
             .map(|n| {
                 (
                     n.clone(),
-                    self.score(self.me, n),
-                    self.score(self.partner, n),
+                    self.points(self.me, n),
+                    self.points(self.partner, n),
                 )
             })
-            .filter(|(_, a, b)| *a > 0 && *b > 0)
+            .filter(|(n, ..)| self.score(self.me, n) > 0 && self.score(self.partner, n) > 0)
             .collect();
-        out.sort_by_key(|(n, a, b)| (-(a + b), n.clone()));
+        out.sort_by(|(n, a, b), (m, c, d)| (c + d).total_cmp(&(a + b)).then(n.cmp(m)));
         out
     }
 
@@ -248,6 +384,14 @@ impl Store {
         let mut changed = other.epoch > self.epoch;
         if changed {
             self.wipe(other.epoch);
+        }
+        // Same timestamp on both sides: the lower device id wins on both.
+        if (other.out_ts, self.me) > (self.out_ts, other.me)
+            && (other.out_ts, &other.out) != (self.out_ts, &self.out)
+        {
+            self.out = other.out;
+            self.out_ts = other.out_ts;
+            changed = true;
         }
         for n in other.removed {
             if !self.removed.contains(&n) {
@@ -294,6 +438,12 @@ impl Store {
         if let Some(a) = self.addr {
             s += &format!("A\t{a}\n");
         }
+        if self.out_ts > 0 {
+            s += &format!("T\t{}\n", self.out_ts);
+        }
+        for (r, n) in &self.out {
+            s += &format!("O\t{r}\t{n}\n");
+        }
         for n in &self.removed {
             s += &format!("R\t{n}\n");
         }
@@ -310,6 +460,10 @@ impl Store {
                 "V\t{d}\t{}\t{yes}\t{}\t{}\t{}\t{n}\n",
                 v.ts, v.streak, v.due, v.score
             );
+            // Its own record for the vote above, which phones without duels skip.
+            if v.duels > 0 {
+                s += &format!("W\t{}\t{}\n", v.elo, v.duels);
+            }
         }
         s
     }
@@ -317,6 +471,7 @@ impl Store {
     /// Lenient: malformed lines are skipped, since packets come from the network.
     pub fn decode(s: &str) -> Store {
         let mut st = Store::default();
+        let mut last = None;
         for line in s.lines() {
             let f: Vec<&str> = line.splitn(8, '\t').collect();
             let (d, ts, yes, streak, due, score, n) = match f[..] {
@@ -364,8 +519,27 @@ impl Store {
                     st.add(n);
                     continue;
                 }
+                ["T", t] => {
+                    st.out_ts = t.parse().unwrap_or(0);
+                    continue;
+                }
+                ["O", r, n] => {
+                    if let Ok(r) = r.parse() {
+                        st.out.push((r, n.into()));
+                    }
+                    continue;
+                }
                 ["R", n] => {
                     st.removed.insert(n.into());
+                    continue;
+                }
+                ["W", elo, duels] => {
+                    if let (Ok(elo), Ok(duels)) = (elo.parse(), duels.parse())
+                        && let Some(v) = last.as_ref().and_then(|k| st.votes.get_mut(k))
+                    {
+                        v.elo = elo;
+                        v.duels = duels;
+                    }
                     continue;
                 }
                 ["V", d, ts, yes, streak, due, score, n] => (d, ts, yes, streak, due, score, n),
@@ -385,10 +559,12 @@ impl Store {
                 "0" => Ok(0),
                 s => s.parse(),
             };
+            last = None;
             if let (Ok(d), Ok(ts), Ok(streak), Ok(due), Ok(score)) =
                 (d.parse(), ts.parse(), streak.parse(), due.parse(), score)
             {
                 st.names.insert(n.into());
+                last = Some((d, n.to_string()));
                 st.votes.insert(
                     (d, n.into()),
                     Vote {
@@ -397,6 +573,7 @@ impl Store {
                         streak,
                         due,
                         score,
+                        ..Vote::default()
                     },
                 );
             }
@@ -526,6 +703,7 @@ pub fn start(sync: Sync, notifier: Notifier) {
                     st.addr = Some(*from.ip());
                     changed = st.merge(other);
                     changed |= st.settle();
+                    changed |= st.eliminate();
                 } else if other.partner == st.me {
                     // It lost a pairing race to us; our hello tells it to look again.
                     sock.send_to(st.hello().as_bytes(), from).ok();
@@ -595,7 +773,7 @@ mod tests {
         assert!(!b.merge(Store::decode(&a.encode())));
 
         let row = |n: &str, mine, theirs| (n.to_string(), mine, theirs);
-        assert_eq!(a.agreed(), [row("Ana", 1, 1)]);
+        assert_eq!(a.agreed(), [row("Ana", 1.0, 1.0)]);
         assert_eq!(a.mine("Luis"), Some(false));
         assert_eq!(a.next().as_deref(), Some("Eva"));
         // Scores add up: -1 +1 +1 is a net like; the higher total sorts first.
@@ -603,13 +781,13 @@ mod tests {
         a.vote("Luis", Some(true));
         b.vote("Luis", Some(true));
         b.merge(Store::decode(&a.encode()));
-        assert_eq!(b.agreed(), [row("Luis", 2, 1), row("Ana", 1, 1)]);
+        assert_eq!(b.agreed(), [row("Luis", 2.0, 1.0), row("Ana", 1.0, 1.0)]);
         // A reset swipe puts the name back in the deck on both sides of a merge.
         a.vote("Ana", None);
         b.merge(Store::decode(&a.encode()));
         a.merge(Store::decode(&b.encode()));
         assert_eq!(a.mine("Ana"), None);
-        assert_eq!(b.agreed(), [row("Luis", 2, 1)]);
+        assert_eq!(b.agreed(), [row("Luis", 2.0, 1.0)]);
         assert_eq!(Store::decode(&b.encode()), b);
     }
 
@@ -686,6 +864,137 @@ mod tests {
         a.merge(msg);
         assert!(a.settle());
         assert!(!a.names.contains("X") && a.names.contains("Y") && !a.ready);
+    }
+
+    #[test]
+    fn duels_rank_the_agreed_names_and_sync() {
+        let mut a = Store {
+            me: 1,
+            partner: 2,
+            ..Default::default()
+        };
+        let mut b = Store {
+            me: 2,
+            partner: 1,
+            ..Default::default()
+        };
+        for n in ["Ana", "Eva", "Zoe"] {
+            a.add(n);
+        }
+        a.vote("Ana", Some(true));
+        a.vote("Ana", Some(true));
+        a.vote("Eva", Some(true));
+        assert_eq!(a.duel(), None, "Zoe is still unswiped");
+        a.vote("Zoe", Some(false));
+        assert_eq!(a.duel(), None, "nothing agreed yet");
+        for n in ["Ana", "Eva", "Zoe"] {
+            b.vote(n, Some(true));
+        }
+        a.merge(Store::decode(&b.encode()));
+        let (x, y) = a.duel().expect("Ana and Eva are agreed");
+        let mut pair = [x, y];
+        pair.sort();
+        assert_eq!(pair, ["Ana", "Eva"]);
+
+        // The underdog keeps winning until it leads; the duels sync over.
+        for _ in 0..10 {
+            a.pick("Eva", "Ana");
+        }
+        assert_eq!(a.agreed()[0].0, "Eva");
+        assert!(
+            (a.points(1, "Eva") + a.points(1, "Ana") - 3.0).abs() < 0.01,
+            "zero-sum"
+        );
+        b.merge(Store::decode(&a.encode()));
+        assert_eq!(b.points(1, "Eva"), a.points(1, "Eva"));
+        assert_eq!(Store::decode(&b.encode()), b);
+
+        // A swipe keeps the duel results, a reset clears them.
+        a.vote("Eva", Some(true));
+        assert_eq!(a.votes[&(1, "Eva".into())].duels, 10);
+        a.vote("Eva", None);
+        assert_eq!(a.points(1, "Eva"), 0.0);
+    }
+
+    #[test]
+    fn rounds_halve_the_names_until_one_wins_on_both_phones() {
+        let phone = |me, partner| Store {
+            me,
+            partner,
+            ..Default::default()
+        };
+        let (mut a, mut b) = (phone(1, 2), phone(2, 1));
+        // Swiped in this order, so the early names lead on points; both
+        // phones actually prefer the last one.
+        let names = ["Ana", "Bea", "Cleo", "Dana", "Eva"];
+        for (i, n) in names.iter().enumerate() {
+            a.add(n);
+            for s in [&mut a, &mut b] {
+                for _ in i..names.len() {
+                    s.vote(n, Some(true));
+                }
+            }
+        }
+        let sync = |a: &mut Store, b: &mut Store| {
+            for _ in 0..2 {
+                b.merge(Store::decode(&a.encode()));
+                b.eliminate();
+                a.merge(Store::decode(&b.encode()));
+                a.eliminate();
+            }
+        };
+        sync(&mut a, &mut b);
+        let favorite = |x: &str, y: &str| {
+            if x > y {
+                (x.to_string(), y.to_string())
+            } else {
+                (y.to_string(), x.to_string())
+            }
+        };
+        let mut taps = 0;
+        while a.winner().is_none() {
+            // Phone a finishes its round first and then waits for b.
+            for s in [&mut a, &mut b] {
+                while let Some((x, y)) = s.duel() {
+                    let (w, l) = favorite(&x, &y);
+                    s.pick(&w, &l);
+                    taps += 1;
+                }
+            }
+            sync(&mut a, &mut b);
+            assert!(taps < 200, "rounds never end");
+        }
+        assert_eq!(a.winner().as_deref(), Some("Eva"));
+        assert_eq!(b.winner(), a.winner());
+        assert_eq!(a.round(), 4, "5 -> 3 -> 2 -> 1");
+        assert_eq!(a.out, b.out);
+        assert_eq!(Store::decode(&a.encode()), a);
+
+        // A loser whose score is reset comes back into the duels.
+        a.vote("Ana", None);
+        a.vote("Ana", Some(true));
+        assert!(a.out.iter().all(|(_, n)| n != "Ana"));
+        assert_eq!(a.winner(), None);
+    }
+
+    #[test]
+    fn simultaneous_eliminations_settle_on_one() {
+        let mut a = Store {
+            me: 1,
+            out: vec![(1, "X".into())],
+            out_ts: 5,
+            ..Default::default()
+        };
+        let mut b = Store {
+            me: 2,
+            out: vec![(1, "Y".into())],
+            out_ts: 5,
+            ..Default::default()
+        };
+        let (from_a, from_b) = (Store::decode(&a.encode()), Store::decode(&b.encode()));
+        assert!(!a.merge(from_b));
+        assert!(b.merge(from_a));
+        assert_eq!(a.out, b.out);
     }
 
     #[test]
@@ -829,7 +1138,8 @@ mod tests {
 
     #[test]
     fn whole_state_fits_one_datagram() {
-        // Every bundled name swiped by both phones, plus room for added names.
+        // Every bundled name swiped by both phones, plus room for added names,
+        // and a shortlist of 50 dueled on both.
         let mut s = Store {
             me: u32::MAX,
             epoch: u64::MAX / 2,
@@ -841,7 +1151,7 @@ mod tests {
             s.add(&format!("Added name {i}"));
         }
         let names: Vec<_> = s.names.iter().cloned().collect();
-        for n in names {
+        for (i, n) in names.into_iter().enumerate() {
             for d in [u32::MAX, u32::MAX - 1] {
                 let v = Vote {
                     ts: u64::MAX / 2,
@@ -849,6 +1159,8 @@ mod tests {
                     streak: 999,
                     due: u32::MAX,
                     score: -999,
+                    elo: -999,
+                    duels: if i < 50 { 9_999 } else { 0 },
                 };
                 s.votes.insert((d, n.clone()), v);
             }
